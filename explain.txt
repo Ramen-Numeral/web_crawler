@@ -1,0 +1,113 @@
+overview
+
+when a query is entered it is routed via ddgs which passes back up to 30 results.
+the first ten distinct urls that pass the checks become depth 0 seeds.
+these are placed onto a frontier heap and popped for the fetcher.
+the fetcher checks a robots rules cache and a manners cache (that includes last request
+reservation time and retry deadline). if no entry is in those caches, robots.txt
+is checked and they are created. the rules are checked for each url. on html pages, links are extracted using
+href anchor parsing, and the remainder of the contents are discarded. the
+orchestrator then enqueues these links.
+
+if the fetcher inspects the manners of the page and it is not ready to be crawled
+(but no other policy violation is visible like an explicit no crawl), then it is
+not fetched and it is sent back to the orchestrator to enqueue on the waiting
+heap. the waiting heap promotes all ready nodes at the start of each scheduling
+loop, before pulling from the frontier heap again. the orchestrator uses
+python's ThreadPoolExecutor to manage worker threads.
+
+robots.txt 429 and 5xx errors also send urls to the waiting heap. after two
+retries for the origin, those urls are skipped.
+
+priority scores are calculated by a combination of host and root novelty
+(the orchestrator owns counts and increments them). the frontier heap is
+roughly bfs-ish, with depth as the primary ordering, followed by priority and
+insertion sequence. the waiting heap is ordered by ready time (monotonic),
+then insertion sequence.
+
+waiting-heap deadlines are not updated in place.
+when a url comes back to a worker, the fetcher rechecks its cached
+manners. if the host is still not ready, the orchestrator adds a new
+waiting-heap entry with the current ready time. the timing
+record changes when a request is reserved or a 429 extends the retry deadline.
+
+one lock guards per-origin timing and robots lookups.
+workers landing on the same new origin share one robots.txt fetch.
+the seen set holds normalized urls, so each link queues once. a separate
+post-redirect set prevents a destination's links from being processed twice.
+dicts track counts per host, per root, per http status.
+
+the frontier and waiting heaps together hold at most 50,000 pending urls.
+new links found while full are dropped, but the crawler has no total page limit.
+throughput is successful 2xx requests without fetch errors divided by elapsed time;
+failed requests stay in the log and status counts.
+
+
+architecture
+
+    query -> ddgs -> ten seeds
+                         |
+                         v
+                  seen set + frontier min-heap
+                         | depth, priority, sequence
+                         v
+                  worker thread pool (32 max)
+                         |
+              robots cache + host delay
+                  /      |       \
+               skip    wait     fetch html
+                        |           |
+                 waiting min-heap   +-> page log
+                        |           +-> parsed links -> seen set -> frontier
+                   ready time
+                        +---------------------------> frontier
+
+priority scoring: 
+
+    host score = 1 / (host count + 1)
+    root score = 1 / (root count + 1)
+    heap priority = -(host score + 0.5 * root score)
+
+
+limitations
+
+1. ddgs can get blocked or return under ten usable results. it auto-picks a
+   backend, so results and ordering drift between runs.
+2. filters deliberately drop wikipedia, archive sites, cgi/edit urls, very
+   long urls, and a list of file types. some good pages die with them.
+3. no js links, no image maps.
+4. crawls can end early if links dry up or hosts fail. 
+5. priority scoring is performed at the time of enqueuing 
+   and not updated therafter
+6. the pending-url cap can drop useful links when both heaps are full.
+7. the no-limit mode has passed offline tests, but not a live 20-minute run.
+
+additional resources/ai usage statement
+additional resources / ai usage statement
+
+- python documentation for the libraries and standard-library modules used.
+- openai codex for:
+  - library syntax assistance;
+  - code review;
+  - debugging assistance;
+  - evaluating architectural trade-offs; and
+  - boilerplate scaffolding.
+
+all crawler design decisions and final code were reviewed and approved by me.
+
+extra features
+
+1. delayed-url heap so workers never sleep waiting on a host's next slot.
+2. normalization strips known tracking params before dedup.
+3. shared in-flight robots.txt lookup per origin.
+4. the initial implementation retried page requests after 429 responses.
+   this was changed to log the 429 once and not retry the page request
+   to comply with the "crawl each URL at most once" requirement. the origin
+   backoff is still updated from Retry-After so other URLs on that host remain
+   polite.
+5. html read capped at limit + 1 byte; oversized responses are discarded
+   without parsing or saving.
+6. trap filters: wikipedia/archive hosts, wiki special pages, edit views,
+   over-length urls.
+7. robots.txt 429 and 5xx responses defer pages on the waiting heap; after
+   two retries the origin is skipped.
